@@ -1398,8 +1398,16 @@ jobs:
               [ -n "${release_tag}" ] || continue
               target_ref="${target_image}:${release_tag}"
               CANDIDATES=()
-              if [ "${STRIP_V_PREFIX}" = true ] && [[ "${release_tag}" == v* ]]; then CANDIDATES+=("${release_tag#v}" "${release_tag}");
-              else CANDIDATES+=("${release_tag}"); if [[ "${release_tag}" == v* ]]; then CANDIDATES+=("${release_tag#v}"); else CANDIDATES+=("v${release_tag}"); fi; fi
+              # 只对纯数字语义版本切换 v 前缀；latest、pg16、7-alpine 等原样处理。
+              if [ "${STRIP_V_PREFIX}" = true ] && [[ "${release_tag}" =~ ^v[0-9]+([.][0-9]+)*([._+-][0-9A-Za-z.-]+)*$ ]]; then
+                CANDIDATES+=("${release_tag#v}" "${release_tag}")
+              elif [[ "${release_tag}" =~ ^v[0-9]+([.][0-9]+)*([._+-][0-9A-Za-z.-]+)*$ ]]; then
+                CANDIDATES+=("${release_tag}" "${release_tag#v}")
+              elif [[ "${release_tag}" =~ ^[0-9]+([.][0-9]+)+([._+-][0-9A-Za-z.-]+)*$ ]]; then
+                CANDIDATES+=("${release_tag}" "v${release_tag}")
+              else
+                CANDIDATES+=("${release_tag}")
+              fi
               source_ref=""; checked=""; probe_errors=""; only_not_found=true
               IFS=',' read -r -a SOURCE_IMAGES <<< "${source_image}"
               for one_source_image in "${SOURCE_IMAGES[@]}"; do
@@ -1441,28 +1449,39 @@ jobs:
               fi
               copy_ok=false
               COPY_FILE="${RUNNER_TEMP}/crane-copy-error.txt"
-              if crane copy "${source_ref}" "${target_ref}" 2> >(tee "${COPY_FILE}" >&2); then
+              if crane copy --jobs=1 "${source_ref}" "${target_ref}" 2> >(tee "${COPY_FILE}" >&2); then
                 echo "成功 ${source_ref} -> ${target_ref}" >> "${SUMMARY}"; last="${source_ref}"; OK=$((OK+1)); copy_ok=true
               else
                 first_copy_error="$(tr '\n' ' ' < "${COPY_FILE}" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
-                echo "::warning::首选源复制失败，将尝试同目标其他候选源：${source_ref} | ${first_copy_error}"
-                for fallback_image in "${SOURCE_IMAGES[@]}"; do
-                  [ -n "${fallback_image}" ] || continue
-                  for fallback_tag in "${CANDIDATES[@]}"; do
-                    fallback_ref="${fallback_image}:${fallback_tag}"
-                    [ "${fallback_ref}" != "${source_ref}" ] || continue
-                    if ! crane manifest "${fallback_ref}" > /dev/null 2>"${PROBE_FILE}"; then continue; fi
-                    echo "尝试备用候选源复制：${fallback_ref} -> ${target_ref}"
-                    if crane copy "${fallback_ref}" "${target_ref}" 2> >(tee "${COPY_FILE}" >&2); then
-                      echo "备用源成功 ${fallback_ref} -> ${target_ref}" >> "${SUMMARY}"; last="${fallback_ref}"; OK=$((OK+1)); copy_ok=true; break 2
-                    fi
+                if [ "${#SOURCE_IMAGES[@]}" -gt 1 ]; then
+                  echo "::warning::首选源复制失败，将尝试同目标其他候选源：${source_ref} | ${first_copy_error}"
+                  for fallback_image in "${SOURCE_IMAGES[@]}"; do
+                    [ -n "${fallback_image}" ] || continue
+                    [ "${fallback_image}" != "${source_ref%:*}" ] || continue
+                    for fallback_tag in "${CANDIDATES[@]}"; do
+                      fallback_ref="${fallback_image}:${fallback_tag}"
+                      if ! crane manifest "${fallback_ref}" > /dev/null 2>"${PROBE_FILE}"; then continue; fi
+                      echo "尝试备用候选源复制：${fallback_ref} -> ${target_ref}"
+                      if crane copy --jobs=1 "${fallback_ref}" "${target_ref}" 2> >(tee "${COPY_FILE}" >&2); then
+                        echo "备用源成功 ${fallback_ref} -> ${target_ref}" >> "${SUMMARY}"; last="${fallback_ref}"; OK=$((OK+1)); copy_ok=true; break 2
+                      fi
+                    done
                   done
-                done
-                if [ "${copy_ok}" != true ]; then echo "失败 ${source_ref}；所有候选源均未能完成复制" >> "${SUMMARY}"; FAIL=$((FAIL+1)); fi
+                else
+                  echo "::warning::单一源复制失败：${source_ref} | ${first_copy_error}"
+                fi
+                if [ "${copy_ok}" != true ]; then
+                  if [ "${#SOURCE_IMAGES[@]}" -gt 1 ]; then
+                    echo "失败 ${source_ref}；所有候选源均未能完成复制" >> "${SUMMARY}"
+                  else
+                    echo "失败 ${source_ref}；单一源复制未完成" >> "${SUMMARY}"
+                  fi
+                  FAIL=$((FAIL+1))
+                fi
               fi
             done < "${TAG_FILE}"
             if [ "${UPDATE_LATEST}" = true ] && [ -n "${last}" ]; then
-              if crane copy "${last}" "${target_image}:latest"; then echo "latest 更新成功：${last} -> ${target_image}:latest" >> "${SUMMARY}"; else echo "latest 更新失败：${last} -> ${target_image}:latest" >> "${SUMMARY}"; FAIL=$((FAIL+1)); fi
+              if crane copy --jobs=1 "${last}" "${target_image}:latest"; then echo "latest 更新成功：${last} -> ${target_image}:latest" >> "${SUMMARY}"; else echo "latest 更新失败：${last} -> ${target_image}:latest" >> "${SUMMARY}"; FAIL=$((FAIL+1)); fi
             fi
           done < "${MAP}"
           echo "Docker 成功：${OK}；跳过：${SKIP}；缺失：${MISSING}；失败：${FAIL}"; cat "${SUMMARY}"
